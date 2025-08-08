@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tiger over Turtles</title>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #111;
+      color: #eee;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      display: grid;
+      place-items: center;
+    }
+    #wrap { display: grid; gap: 10px; place-items: center; }
+    canvas {
+      background: linear-gradient(#a9d6ff, #c9ecff 40%, #f6f1d3 40%, #e9d9a2);
+      border: 2px solid #222;
+      border-radius: 10px;
+      image-rendering: pixelated;
+      max-width: 92vw;
+      height: auto;
+    }
+    .hud { text-align: center; font-size: 14px; opacity: .9; }
+    button {
+      background: #222; color: #eee; border: 1px solid #444;
+      padding: 6px 10px; border-radius: 8px; cursor: pointer;
+    }
+    a { color: #8fd1ff; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="960" height="540" aria-label="Tiger over Turtles canvas"></canvas>
+    <div class="hud">
+      <div id="status">Loading…</div>
+      <div id="tips">Tip: press <b>Space</b> or click/tap to jump. Avoid the turtles!</div>
+    </div>
+    <div style="display:flex;gap:10px">
+      <button id="restartBtn" style="display:none">Restart</button>
+      <button id="muteBtn">Mute</button>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  // Game state
+  let started = false;
+  let gameOver = false;
+  let score = 0;
+  let highScore = +localStorage.getItem('tot_highscore') || 0;
+  let lastSpawn = 0;
+  let spawnEvery = 1400; // ms
+  let lastTime = 0;
+  let turtles = [];
+  let muted = false;
+
+  const statusEl = document.getElementById('status');
+  const restartBtn = document.getElementById('restartBtn');
+  const muteBtn = document.getElementById('muteBtn');
+
+  // Ground line
+  const groundY = H * 0.75;
+
+  // Sounds (tiny generated beeps so no external assets)
+  function beep(freq, duration) {
+    if (muted) return;
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const actx = beep._ctx || (beep._ctx = new AudioCtx());
+      const o = actx.createOscillator();
+      const g = actx.createGain();
+      o.connect(g); g.connect(actx.destination);
+      o.type = 'square'; o.frequency.value = freq;
+      g.gain.value = 0.02;
+      const now = actx.currentTime;
+      o.start(now);
+      o.stop(now + duration/1000);
+    } catch(e) { /* ignore */ }
+  }
+
+  muteBtn.addEventListener('click', () => {
+    muted = !muted;
+    muteBtn.textContent = muted ? 'Unmute' : 'Mute';
+  });
+
+  // Player (Tiger)
+  const tigerImg = new Image();
+  tigerImg.src = 'tiger3.png'; // put this file next to index.html (case-sensitive)
+  let tigerReady = false;
+  let useFallbackTiger = false;
+
+  tigerImg.onload = () => { tigerReady = true; maybeStart(); };
+  tigerImg.onerror = () => {
+    useFallbackTiger = true;
+    tigerReady = true; // still allow game to play with fallback
+    maybeStart();
+  };
+
+  const tiger = {
+    x: W * 0.18,
+    y: groundY,
+    size: 110,
+    vy: 0,
+    onGround: true,
+    jump() {
+      if (!this.onGround) return;
+      this.vy = -18; // stronger jump
+      this.onGround = false;
+      beep(880, 120);
+    },
+    update(dt) {
+      // gravity
+      this.vy += 48 * dt; // px/s^2 scaled
+      this.y += this.vy;
+      if (this.y >= groundY) {
+        this.y = groundY;
+        this.vy = 0;
+        this.onGround = true;
+      }
+    },
+    draw() {
+      const s = this.size;
+      const yTop = this.y - s;
+      if (!useFallbackTiger && tigerReady) {
+        ctx.drawImage(tigerImg, this.x - s*0.5, yTop, s, s);
+      } else {
+        // fallback: simple shape
+        ctx.save();
+        ctx.translate(this.x, yTop + s*0.55);
+        ctx.fillStyle = '#d07b2d';
+        ctx.beginPath(); ctx.arc(0, 0, s*0.45, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#000';
+        ctx.fillRect(-s*0.15, -s*0.05, s*0.3, s*0.1);
+        ctx.restore();
+      }
+    },
+    bounds() {
+      const s = this.size;
+      return {x: this.x - s*0.42, y: this.y - s*0.95, w: s*0.84, h: s*0.9};
+    }
+  };
+
+  // Turtles
+  function spawnTurtle() {
+    const speed = 260 + Math.min(180, score * 0.5);
+    const size = 46 + Math.random()*22;
+    const t = {
+      x: W + 20,
+      w: size,
+      h: size * 0.5,           // back to half-height
+      y: groundY - size * 0.25,// center the shell
+      speed,
+      draw() {
+        const {x, y, w, h} = this;
+        ctx.fillStyle = 'rgba(0,0,0,0.2)';
+        ctx.beginPath(); ctx.ellipse(x, groundY + 6, w*0.5, 6, 0, 0, Math.PI*2); ctx.fill();
+
+        ctx.fillStyle = '#2e5d34';
+        ctx.beginPath(); ctx.ellipse(x, y, w*0.5, h*0.6, 0, 0, Math.PI*2); ctx.fill();
+        ctx.strokeStyle = '#193a1e';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(x, y, h*0.5, Math.PI*0.15, Math.PI*0.85);
+        ctx.stroke();
+
+        ctx.fillStyle = '#35683b';
+        ctx.beginPath(); ctx.ellipse(x + w*0.45, y + 2, w*0.22, h*0.32, 0, 0, Math.PI*2); ctx.fill();
+
+        ctx.fillStyle = '#fff'; ctx.beginPath();
+        ctx.arc(x + w*0.54, y - 1, 4, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#111'; ctx.beginPath();
+        ctx.arc(x + w*0.56, y - 1, 2, 0, Math.PI*2); ctx.fill();
+
+        ctx.fillStyle = '#2e5d34';
+        ctx.fillRect(x - w*0.35, y + h*0.22, 10, 12);
+        ctx.fillRect(x - w*0.05, y + h*0.22, 10, 12);
+      },
+      update(dt) { this.x -= this.speed * dt; }
+    };
+    turtles.push(t);
+  }
+
+  // forgiving hitboxes
+  function shrinkBox(b, f=0.7) {
+    const dx = b.w * (1 - f) / 2;
+    const dy = b.h * (1 - f) / 2;
+    return { x: b.x + dx, y: b.y + dy, w: b.w * f, h: b.h * f };
+  }
+  function rectsOverlap(a, b) {
+    return !(a.x + a.w < b.x || a.x > b.x + b.w || a.y + a.h < b.y || a.y > b.y + b.h);
+  }
+
+  function maybeStart() {
+    if (tigerReady && !started) {
+      drawSplash('Press Space / Click to Start');
+      statusEl.textContent = 'Ready! Press Space or Click to start.';
+    }
+  }
+
+  // Input
+  function startGame() {
+    if (!started) {
+      started = true;
+      gameOver = false;
+      turtles = [];
+      score = 0;
+      lastSpawn = 0;
+      lastTime = performance.now();
+      restartBtn.style.display = 'none';
+      statusEl.textContent = 'Go!';
+      requestAnimationFrame(loop);
+    } else if (!gameOver) {
+      tiger.jump();
+    }
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') { e.preventDefault(); startGame(); }
+    if (e.code === 'ArrowUp') { e.preventDefault(); tiger.jump(); }
+  });
+  canvas.addEventListener('pointerdown', startGame);
+  document.getElementById('restartBtn').addEventListener('click', () => {
+    started = false; maybeStart();
+  });
+
+  // Drawing helpers
+  function drawGround() {
+    ctx.strokeStyle = '#7a5f31';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(0, groundY + 1);
+    ctx.lineTo(W, groundY + 1);
+    ctx.stroke();
+  }
+
+  function drawSplash(text) {
+    ctx.clearRect(0,0,W,H);
+    drawGround();
+    // title
+    ctx.fillStyle = '#00000033';
+    ctx.fillRect(0,0,W,110);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 40px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Tiger over Turtles', W/2, 68);
+    ctx.font = '16px system-ui, sans-serif';
+    ctx.fillText(text, W/2, 96);
+    tiger.draw();
+  }
+
+  function loop(now) {
+    const dt = Math.min(0.033, (now - lastTime) / 1000);
+    lastTime = now;
+
+    // Update
+    tiger.update(dt);
+    turtles.forEach(t => t.update(dt));
+    turtles = turtles.filter(t => t.x > -120);
+
+    // spawn
+    if (now - lastSpawn > spawnEvery) {
+      spawnTurtle();
+      lastSpawn = now;
+      spawnEvery = 900 + Math.random()*900;
+    }
+
+    // collisions (use shrunken boxes)
+    const tb = shrinkBox(tiger.bounds(), 0.85);
+    for (const t of turtles) {
+      const bbRaw = { x: t.x - t.w*0.5, y: t.y - t.h*0.5, w: t.w, h: t.h };
+      const bb = shrinkBox(bbRaw, 0.85);
+      if (rectsOverlap(tb, bb)) { gameOver = true; break; }
+    }
+
+    // score
+    if (!gameOver) score += dt * 60;
+
+    // Draw
+    ctx.clearRect(0,0,W,H);
+    drawGround();
+    turtles.forEach(t => t.draw());
+    tiger.draw();
+
+    // HUD
+    ctx.fillStyle = '#111';
+    ctx.font = '18px system-ui, sans-serif';
+    ctx.fillText('Score: ' + Math.floor(score), 16, 28);
+    ctx.fillText('Best: ' + Math.floor(highScore), 16, 52);
+
+    if (gameOver) {
+      if (score > highScore) {
+        highScore = Math.floor(score);
+        localStorage.setItem('tot_highscore', highScore);
+      }
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 38px system-ui, sans-serif';
+      ctx.fillText('Bonk! You hit a turtle.', W/2, H/2 - 20);
+      ctx.font = '18px system-ui, sans-serif';
+      ctx.fillText('Click or press Space to try again', W/2, H/2 + 16);
+      statusEl.textContent = 'Game over. Click/Space to restart.';
+      restartBtn.style.display = 'inline-block';
+      started = false;
+      return; // stop loop until restart
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  // Initial loading frame
+  ctx.fillStyle = '#fff';
+  ctx.font = '24px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('Loading…', W/2, H/2 - 10);
+  drawGround();
+})();
+</script>
+</body>
+</html>
